@@ -1,0 +1,349 @@
+---
+title: "Final ST494 Project"
+author: "Diya Mistry"
+date: "2025-04-03"
+output: html_document
+---
+
+# Load Packages
+
+```{r}
+library(forcats)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(tidyr)
+library(glmnet)
+library(cluster)
+library(rpart)
+library(stringr)
+library(MASS) 
+library(randomForest)
+library(nnet)
+library(mclust)
+library(GGally)
+library(naniar)
+library(polycor)
+library(ggcorrplot)
+```
+
+# Clean/Preprocess Data
+
+## Column Removal & Missing Values
+
+```{r}
+product_info <- read.csv("product_info.csv")
+
+# Visualize missing values
+product_info[product_info == ""] <- NA
+vis_miss(product_info) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Check correlations to decide column removal
+cor_matrix <- cor(product_info %>% dplyr::select(where(is.numeric)), use = "pairwise.complete.obs")
+print(cor_matrix)
+
+# Check if missing values are associated with specific categories
+table(product_info$primary_category, is.na(product_info$sale_price_usd))
+
+# Remove unnecessary columns with excessive missing values or irrelavent info
+product_info2 <- product_info %>% dplyr::select(-c(product_id, ingredients, variation_value, variation_desc, value_price_usd, sale_price_usd, child_max_price, child_min_price))
+```
+
+## One-Hot Encoding for primary_category & secondary_category
+
+```{r}
+product_info2$primary_category <- as.factor(product_info2$primary_category)
+dummy_vars <- dummyVars(" ~ primary_category", data = product_info2)
+primary_category_encoded <- predict(dummy_vars, newdata = product_info2) %>% as.data.frame()
+product_info3 <- cbind(product_info2, primary_category_encoded)
+
+product_info3$secondary_category <- fct_lump(factor(product_info3$secondary_category), n = 10)
+dummy_vars2 <- dummyVars(" ~ secondary_category", data = product_info3)
+secondary_category_encoded <- predict(dummy_vars2, newdata = product_info3) %>% as.data.frame()
+product_info4 <- cbind(product_info3, secondary_category_encoded)
+```
+
+## Convert Ratings to Rounded Whole Values
+
+```{r}
+# convert ratings to rounded whole values
+product_info4$rating_rounded <- round(product_info4$rating)
+product_info4$rating_rounded <- pmin(pmax(product_info4$rating_rounded, 1), 5)
+```
+
+## Extract Ounces From size
+
+```{r}
+extract_oz <- function(size) {
+  if (is.na(size)) return(NA)
+  size <- tolower(size)
+  
+  if (!str_detect(size, "oz")) return(NA)
+  
+  # Case 1: "8 x .02 oz" format
+  if (str_detect(size, "\\d+\\s*x\\s*\\.?\\d+\\s*oz")) {
+    # Extract multiplier and quantity
+    matches <- str_match(size, "(\\d+)\\s*x\\s*(\\.?\\d+)\\s*oz")
+    multiplier <- as.numeric(matches[2])
+    quantity <- as.numeric(matches[3])
+    return(multiplier * quantity)
+  }
+  
+  # Case 2: regular oz value like "1.7 oz" or ".5 oz" format
+  oz_match <- str_match(size, "(\\d+\\.?\\d*|\\.\\d+)\\s*oz")
+  if (!is.na(oz_match[1])) {
+    return(as.numeric(oz_match[2]))
+  }
+  
+  return(NA)
+}
+
+product_final <- product_info4 %>%
+  mutate(size_oz = sapply(size, extract_oz)) 
+
+head(product_final)
+```
+
+# Variable Exploration & Relationships
+
+## Understand Data Structure
+
+```{r}
+str(product_final) 
+summary(product_final)
+```
+
+## Analyze Correlation Between Numeric Variables
+
+```{r}
+#exclude non-numeric and categorical variables
+product_final_numeric <- product_final %>% dplyr::select(c(loves_count, rating, reviews, price_usd, child_count, size_oz))
+
+# Compute the correlation matrix using hetcor for mixed data types we see more the most part correlations are low therfore therefore not too many distinct relationships between varaibles
+cor_matrix <- hetcor(product_final_numeric %>% dplyr::select(where(is.numeric)))$correlations
+ggcorrplot(cor_matrix, lab = TRUE, lab_size = 3, type = "lower", colors = c("red", "white", "blue"))
+
+
+```
+
+## Rating Distribution and Price Across Brands
+
+```{r}
+# Sample 1000 random rows for the plot
+set.seed(50)
+data_sampled <- product_final %>%
+  sample_n(1000)
+
+# Compute median price per brand
+brand_summary <- data_sampled %>%
+  group_by(brand_name) %>%
+  summarize(median_price = median(price_usd, na.rm = TRUE),
+            avg_rating = mean(rating, na.rm = TRUE),
+            count = n()) %>%
+  arrange(desc(avg_rating)) %>%
+  top_n(30, count) #25 brands with most products
+
+# Merge median price into data_filtered
+data_filtered <- data_sampled %>%
+  filter(brand_name %in% brand_summary$brand_name) %>%
+  left_join(brand_summary %>% dplyr::select(brand_name, median_price), by = "brand_name")
+
+# Boxplot for Ratings by Brand (Colored by Median Price)
+ggplot(data_filtered, aes(x = reorder(brand_name, rating, FUN = median), 
+                          y = rating, fill = median_price)) +
+  geom_boxplot() +
+  coord_flip() +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Rating Distribution Across Brands by Price",
+       x = "Brand Name",
+       y = "Rating",
+       fill = "Median Price (USD)") +
+  theme_minimal()
+```
+
+## Prices Across Categories
+
+```{r}
+ggplot(data_sampled, aes(x = primary_category, y = price_usd)) +
+  geom_boxplot(outlier.shape = 21, outlier.alpha = 0.5) + 
+  scale_y_log10() +
+  labs(title = "Price Distributions Across Categories", x = "Primary Category", y = "Price (USD)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+```
+
+# Use Cases
+
+## Use Case 1: Determine what brand may be more worth purchasing
+
+Brands with a lower avg price but a better avg rating may be a better brand to buy from, perform k means clustering, used elbow method to determine optimal number of clusters, and use silhouette. score to evaluate the clusters.
+
+```{r}
+# Remove rows with no ratings
+data_cleaned <- product_final %>% drop_na(reviews, rating)
+
+# Group by brand_name and calculate average price and rating
+brand_avg_data <- data_cleaned %>%
+  group_by(brand_name) %>%
+  summarise(
+    avg_price = mean(price_usd, na.rm = TRUE),
+    avg_rating = mean(rating, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Normalize features
+brand_scaled <- brand_avg_data %>%
+  dplyr::select(avg_price, avg_rating) %>%
+  scale() %>%
+  as.data.frame()
+
+# Apply PCA to change direction of axis and removes correlation to help k means geometry
+pca_result <- prcomp(brand_scaled, center = TRUE, scale. = TRUE)
+brand_pca <- as.data.frame(pca_result$x[, 1:2])  # Use PC1 and PC2
+colnames(brand_pca) <- c("PC1", "PC2")
+
+# Determine optimal k with Elbow Method
+number_k <- sapply(1:10, function(k) {
+  kmeans(brand_pca, centers = k, nstart = 10)$tot.withinss
+})
+
+plot(1:10, number_k, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (k)", ylab = "Sum of Squared Errors (SSE)",
+     main = "Elbow Method on PCA-Reduced Data")
+
+# Apply K-means with k = 4
+set.seed(123)
+kmeans_result <- kmeans(brand_pca, centers = 4, nstart = 10)
+brand_pca$cluster <- as.factor(kmeans_result$cluster)
+
+# Combine clusters with brand info
+brand_avg_data$cluster <- brand_pca$cluster
+
+#Visualize clusters using PC1 and PC2
+ggplot(brand_pca, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.7, size = 4) +
+  labs(title = "K-Means Clustering on PCA",
+       x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+
+# View clustered data
+head(brand_avg_data)
+
+# Evaluate with silhouette score
+silhouette_result <- silhouette(kmeans_result$cluster, dist(brand_pca))
+avg_silhouette_score <- mean(silhouette_result[, 3])
+cat("Average Silhouette Score (PCA, k = 4):", avg_silhouette_score)
+
+#Analyze the clusters
+brand_avg_data %>%
+  group_by(cluster) %>%
+  summarise(
+    avg_price = mean(avg_price),
+    avg_rating = mean(avg_rating),
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(avg_price, desc(avg_rating))
+```
+
+For this I tried it without PCA first but that gave me really low silhouette scores so the clusters weren't doing their jobs so I added PCA to better help scale the space. I tested with 3-6 clusters since that is where the decline slows down and i tried another graph to look at the silhouette scores and that had the lowest. I ultimately settled on k=4 which gave me the highest silhouette score. I didn't get rid of the outliers here since they most likely represent the luxury brands.
+
+## Use Case 2 (Multiclass Classification): Predicting Ratings for Products (binary AND continuous)
+
+### Apply PCA
+
+First Try: Continuous and Binary Dummy, best cumulative proportion = 0.39
+
+```{r}
+# Define the columns to include in PCA
+continuous_columns <- c("price_usd", "size_oz", "reviews", "child_count", "loves_count")
+binary_columns <- c("limited_edition", "new", "sephora_exclusive")
+pca_columns <- c(continuous_columns, binary_columns)
+
+
+product.df_pca <- product_final[, pca_columns]
+
+# Clean the dataset by removing rows with missing or infinite values
+product.df_pca_clean <- product.df_pca[complete.cases(product.df_pca) & 
+                                       !apply(product.df_pca, 1, function(x) any(is.infinite(x))), ]
+
+# Scale continuous features
+product.df_pca_continuous <- product.df_pca_clean[, continuous_columns]
+product.df_pca_binary <- product.df_pca_clean[, binary_columns]
+product.df_scaled_continuous <- scale(product.df_pca_continuous)
+product.df_scaled <- cbind(product.df_scaled_continuous, product.df_pca_binary)
+
+# Remove constant columns (those with zero variance)
+product.df_scaled_clean <- product.df_scaled[, apply(product.df_scaled, 2, var) != 0]
+
+pca_result <- prcomp(product.df_scaled_clean, scale. = TRUE)
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_scores) <- c("PC1", "PC2")
+summary(pca_result)
+print(round(pca_result$rotation[, 1:2], 8))
+screeplot(pca_result, main = "Scree plot of PCA")
+```
+
+Second Try: Continuous variables, best cumulative proportion = 0.60
+
+```{r}
+pca_columns <- c("price_usd", "size_oz", "reviews", "child_count","loves_count")
+product.df_pca <- product_final[, pca_columns]
+product.df_pca_clean <- product.df_pca[complete.cases(product.df_pca) & 
+                                       !apply(product.df_pca, 1, function(x) any(is.infinite(x))), ]
+product.df_scaled <- scale(product.df_pca_clean)
+
+pca_result <- princomp(product.df_scaled, cor = TRUE)
+pca_scores <- as.data.frame(pca_result$scores[, 1:2])
+colnames(pca_scores) <- c("PC1", "PC2")
+
+product_uc1 <- cbind(product_final[rownames(pca_scores), ], pca_scores)
+product_uc1$rating_rounded <- as.factor(product_uc1$rating_rounded)
+
+summary(pca_result)
+print(round(loadings(pca_result), 8))
+screeplot(pca_result, main = "Scree plot of PCA")
+```
+
+### Logistic Regression + PCA
+
+```{r}
+colnames(product_uc1) <- gsub("primary_category.Mini Size", "primary_category.MiniSize", colnames(product_uc1))
+colnames(product_uc1) <- gsub("primary_category.Tools & Brushes", "primary_category.ToolsBrushes", colnames(product_uc1))
+
+set.seed(123) 
+train_index <- createDataPartition(product_uc1$rating_rounded, p = 0.8, list = FALSE)
+train_data <- product_uc1[train_index, ]
+test_data <- product_uc1[-train_index, ]
+
+# multinomial logistic regression model 
+log_reg_model <- multinom(rating_rounded ~ PC1 + PC2 + limited_edition + 
+                             `primary_category.Fragrance` + 
+                             `primary_category.Gifts` + 
+                             `primary_category.Hair` + 
+                             `primary_category.Makeup` + 
+                             `primary_category.Men` + 
+                             `primary_category.MiniSize` +  
+                             `primary_category.Skincare` + 
+                             `primary_category.ToolsBrushes`, 
+                         data = train_data)
+predictions <- predict(log_reg_model, test_data)
+classification_report <- caret::confusionMatrix(predictions, test_data$rating_rounded)
+classification_report
+```
+
+### Random Forest (No PCA)
+
+```{r}
+# calculating class weights (inverse of class frequencies)
+#class_weights <- 1 / table(product.df_selected_clean$rating_rounded)
+#class_weights <- class_weights / sum(class_weights)  # Normalize to sum to 1
+
+# train a random forest model (with class weights)
+rf_model <- randomForest(rating_rounded ~ price_usd + size_oz + reviews + child_count + loves_count + limited_edition + `primary_category.Fragrance` + `primary_category.Gifts` + `primary_category.Hair` + `primary_category.Makeup` + `primary_category.Men` + `primary_category.MiniSize` + `primary_category.Skincare` + `primary_category.ToolsBrushes`, data = train_data, ntree = 100) #classwt=class_weights)
+
+# predict on the test data using the random forest model
+predicted.rf <- predict(rf_model, test_data)  
+conf_matrix_rf <- table(predicted.rf, test_data$rating_rounded)
+conf_matrix_caret <- confusionMatrix(conf_matrix_rf)
+conf_matrix_caret
+```
